@@ -109,6 +109,16 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
       return false;
     }
 
+    // DeepSeek V4 models (deepseek-chat, deepseek-v4-*) support thinking mode
+    // which is incompatible with the tool_choice parameter used by structured output.
+    // These models can successfully extract JSON from natural language responses instead.
+    if (this.modelName.includes('deepseek') && (this.modelName === 'deepseek-chat' || this.modelName.includes('v4'))) {
+      logger.debug(
+        `[${this.modelName}] DeepSeek V4 model may use thinking mode, falling back to manual JSON extraction`,
+      );
+      return false;
+    }
+
     // Llama API models don't support json_schema response format
     if (this.provider === ProviderTypeEnum.Llama || this.isLlamaModel(this.modelName)) {
       logger.debug(`[${this.modelName}] Llama API doesn't support structured output, using manual JSON extraction`);
