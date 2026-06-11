@@ -24,24 +24,95 @@ export const FILE_CONTENT_TAG_END = '</nano_file_content>';
 /**
  * Remove think tags from model output
  * Some models use <think> tags for internal reasoning that should be removed
+ * Handles case-insensitivity, optional attributes, and unclosed tags.
  * @param text - The text containing potential think tags
  * @returns Text with think tags removed
  */
 export function removeThinkTags(text: string): string {
-  // Step 1: Remove well-formed <think>...</think>
-  const thinkTagsRegex = /<think>[\s\S]*?<\/think>/g;
-  let result = text.replace(thinkTagsRegex, '');
+  // Step 1: Remove well-formed <think>...</think> (case-insensitive, with optional attributes)
+  // Matches <think>, <Think>, <think lang="en">, <think class="reasoning">, etc.
+  const thinkRegex = /<think\b[^>]*>[\s\S]*?<\/think\s*>/gi;
+  let result = text.replace(thinkRegex, '');
 
-  // Step 2: If there's an unmatched closing tag </think>,
-  // remove everything up to and including that.
-  const strayCloseTagRegex = /[\s\S]*?<\/think>/g;
-  result = result.replace(strayCloseTagRegex, '');
+  // Step 2: Remove any remaining standalone opening <think> tags (unclosed)
+  // Keeps content after the tag since valid JSON might follow.
+  result = result.replace(/<think\b[^>]*>/gi, '');
+
+  // Step 3: If there's a stray closing tag </think> without opening,
+  // remove everything up to and including that (defensive).
+  // This regex matches from the start of text (or last match end) to </think>,
+  // which is intentionally destructive for malformed output.
+  const strayCloseRegex = /[\s\S]*?<\/think\s*>/gi;
+  result = result.replace(strayCloseRegex, '');
 
   return result.trim();
 }
 
 /**
- * Extract JSON from model output, handling both plain JSON and code-block-wrapped JSON.
+ * Try to locate and parse the first JSON object or array within a string.
+ * Searches for the outermost { ... } or [ ... ] structure via a simple
+ * brace/ bracket depth counter so it works even when there is surrounding
+ * prose or trailing content.
+ */
+function tryExtractJsonFromString(text: string): Record<string, unknown> {
+  // Try parsing the whole thing first (fast path)
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      // fall through to extraction
+    }
+  }
+
+  // Search for the first JSON-like structure: { ... } or [ ... ]
+  for (const startChar of ['{', '['] as const) {
+    const startIdx = trimmed.indexOf(startChar);
+    if (startIdx === -1) continue;
+
+    const endChar = startChar === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+
+    for (let i = startIdx; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\' && inString) {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+
+      if (ch === startChar) depth++;
+      if (ch === endChar) depth--;
+      if (depth === 0) {
+        // Found a balanced outermost structure
+        const candidate = trimmed.slice(startIdx, i + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          // Not valid JSON – keep looking for another candidate
+          break;
+        }
+      }
+    }
+  }
+
+  throw new Error('No valid JSON found in text');
+}
+
+/**
+ * Extract JSON from model output, handling plain JSON, code-block-wrapped JSON,
+ * and JSON embedded in surrounding text.
  * @param content - The string content that potentially contains JSON.
  * @returns Parsed JSON object
  * @throws Error if JSON parsing fails
@@ -125,10 +196,17 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
       if (processedContent.startsWith('json')) {
         processedContent = processedContent.substring(4).trim();
       }
+
+      // Try parsing the code block content directly
+      try {
+        return JSON.parse(processedContent);
+      } catch {
+        // Fall through to tryExtractJsonFromString below
+      }
     }
 
-    // Parse the cleaned content
-    return JSON.parse(processedContent);
+    // Final attempt: parse directly or search for JSON in the text
+    return tryExtractJsonFromString(processedContent);
   } catch (e) {
     throw new ResponseParseError(`Could not manually extract JSON from model output`);
   }
